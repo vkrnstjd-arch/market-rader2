@@ -1380,20 +1380,6 @@ def render_portfolio_page(portfolio, market_pack, crash_df, settings):
         else:
             st.info(f"{icon} {msg}")
 
-    st.subheader("전술 리밸런싱 — SOL 반도체전공정 목표 3.5%")
-    try:
-        target_price, target_date = latest_price(TACTICAL_PLAN["ticker"])
-    except Exception:
-        target_price, target_date = np.nan, "—"
-    orders, current_tw, desired = tactical_orders(portfolio, total, target_price, settings["min_trade_krw"])
-    if orders.empty:
-        st.success(f"현재 전공정 비중 {current_tw:.2f}% — 목표 3.5%와의 차이가 최소 거래기준보다 작아 추가 주문 없음.")
-    else:
-        st.caption(f"현재 전공정 {current_tw:.2f}% → 목표 3.5% · 목표 ETF 최근가 {target_price:,.0f}원 ({target_date})" if pd.notna(target_price) else f"현재 전공정 {current_tw:.2f}% → 목표 3.5%")
-        show_orders = orders.copy()
-        st.dataframe(show_orders.style.format({"예상금액": "{:,.0f}원"}), use_container_width=True, hide_index=True)
-        st.caption("매일 시트 비중을 다시 읽어 목표에 가까워질수록 주문 제안이 자동으로 줄어듭니다. 최소 거래금액 이하이면 아무 거래도 제안하지 않습니다.")
-
     st.subheader("현재 포트")
     pshow = portfolio[["종목", "코드", "평가금액", "비중", "수량", "분류", "지역"]].sort_values("평가금액", ascending=False).copy()
     st.dataframe(pshow.style.format({"평가금액": "{:,.0f}원", "비중": "{:.2f}%", "수량": "{:,.0f}"}, na_rep="—"), use_container_width=True, hide_index=True)
@@ -1666,3 +1652,4 @@ else:
 
 st.divider()
 st.caption("투자 의사결정 보조용 개인 대시보드입니다. 가격 데이터 오류·지연, Google Sheet 접근권한, 세금·슬리피지·환율·상품구조를 실제 주문 전 별도로 확인하세요.")
+
