@@ -1,3 +1,4 @@
+# PORTFOLIO_OS_FINAL_20260818_V14_1
 
 import streamlit as st
 import pandas as pd
@@ -781,11 +782,10 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=
 # =========================================================
 import io
 import re
-from urllib.parse import quote
 import requests
 
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1B9jNFFQW0dCqZUzJMoHb7sNpT-9k02G16A2PwJPUx9A/edit?usp=drivesdk"
-DEFAULT_SHEET_NAME = "포트폴리오"
+DEFAULT_SHEET_NAME = "현황"
 
 # 사용자가 지금 논의 중인 전술 포지션. 목표에 도달하면 자동으로 추가매수 제안이 사라집니다.
 TACTICAL_PLAN = {
@@ -807,13 +807,16 @@ TACTICAL_PLAN = {
 # 기본 알림 문턱은 1.5년(약 1~2년에 한 번 꼴)로 보수적으로 설정합니다.
 # start_dd는 '폭락 이벤트 시작'을 인식하기 위한 자산별 최소 낙폭입니다.
 CRASH_ASSETS = {
-    "미국 장기채": {"ticker": "TLT", "group": "채권", "proxy": "TLT", "start_dd": -0.05},
-    "금": {"ticker": "GC=F", "group": "원자재", "proxy": "금 선물", "start_dd": -0.075},
-    "은": {"ticker": "SI=F", "group": "원자재", "proxy": "은 선물", "start_dd": -0.12},
-    "구리": {"ticker": "HG=F", "group": "원자재", "proxy": "구리 선물", "start_dd": -0.12},
-    "브렌트유": {"ticker": "BZ=F", "group": "원자재", "proxy": "브렌트 선물", "start_dd": -0.15},
-    "BTC": {"ticker": "BTC-USD", "group": "코인", "proxy": "BTC", "start_dd": -0.20},
-    "ETH": {"ticker": "ETH-USD", "group": "코인", "proxy": "ETH", "start_dd": -0.25},
+    # start_dd: event counting starts here.
+    # min_abs_mdd + worst_frac: actual BUY/ALERT depth gate.
+    # Required depth = the deeper of the absolute floor and a fraction of that asset's historical worst ATH drawdown.
+    "미국 장기채": {"ticker": "TLT", "group": "채권", "proxy": "TLT", "start_dd": -0.08, "min_abs_mdd": -0.22, "worst_frac": 0.55},
+    "금": {"ticker": "GC=F", "group": "원자재", "proxy": "금 선물", "start_dd": -0.10, "min_abs_mdd": -0.25, "worst_frac": 0.55},
+    "은": {"ticker": "SI=F", "group": "원자재", "proxy": "은 선물", "start_dd": -0.15, "min_abs_mdd": -0.40, "worst_frac": 0.60},
+    "구리": {"ticker": "HG=F", "group": "원자재", "proxy": "구리 선물", "start_dd": -0.15, "min_abs_mdd": -0.35, "worst_frac": 0.60},
+    "브렌트유": {"ticker": "BZ=F", "group": "원자재", "proxy": "브렌트 선물", "start_dd": -0.20, "min_abs_mdd": -0.40, "worst_frac": 0.55},
+    "BTC": {"ticker": "BTC-USD", "group": "코인", "proxy": "BTC", "start_dd": -0.25, "min_abs_mdd": -0.50, "worst_frac": 0.60},
+    "ETH": {"ticker": "ETH-USD", "group": "코인", "proxy": "ETH", "start_dd": -0.30, "min_abs_mdd": -0.60, "worst_frac": 0.60},
 }
 
 
@@ -833,15 +836,13 @@ FALLBACK_PORTFOLIO = [
     ("에이피알", "278470", 42_955_000, 390_500, 110),
     ("삼성전자우", "005935", 41_076_000, 195_600, 210),
     ("한국금융지주", "071050", 29_580_000, 204_000, 145),
-    ("오라클", "ORCL", 10_660_353, 150.52, 50),
-    ("마이크론", "MU", 8_257_963, 971.66, 6),
-    ("블룸에너지", "BE", 8_142_578, 229.94, 25),
-    ("루멘텀", "LITE", 7_871_097, 926.14, 6),
-    ("코히어런트", "COHR", 6_922_926, 325.83, 15),
+    ("마이크론", "MU", 11_453_317, 1013.41, 8),
+    ("블룸에너지", "BE", 11_184_547, 239.91, 33),
+    ("루멘텀", "LITE", 10_669_540, 944.06, 8),
+    ("코히어런트", "COHR", 9_650_008, 341.54, 20),
     ("VIP펀드", "", 31_850_000, 2171, 0),
-    ("예수금", "", 38_420_000, np.nan, 0),
+    ("예수금", "", 38_090_000, np.nan, 0),
 ]
-
 
 def _num(v):
     if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -872,77 +873,100 @@ def fallback_portfolio_df():
     df = pd.DataFrame(FALLBACK_PORTFOLIO, columns=["종목", "코드", "평가금액", "현재가", "수량"])
     total = df["평가금액"].sum()
     df["비중"] = df["평가금액"] / total * 100
-    df["데이터원"] = "8/16 fallback"
+    df["데이터원"] = "latest fallback"
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_google_portfolio(sheet_url: str, sheet_name: str):
+    """
+    Read the public Google Sheet with Google's raw CSV export endpoint.
+
+    The portfolio tab is fixed at gid=0 (현황). We intentionally do NOT rely on
+    Google/Streamlit header inference or a Korean worksheet name, because those
+    were the source of the previous failures. Instead we read the raw rows and
+    use the sheet's stable column positions:
+      A=종목, B=코드, E=평가금액, G=현재가, K=수량, M=수익률.
+    Rows below 'Pluto' are watchlist/scratch rows and are excluded.
+    """
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", sheet_url)
     if not m:
         raise ValueError("Google Sheet URL에서 문서 ID를 찾지 못했습니다.")
+
     sid = m.group(1)
-    csv_url = f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
-    r = requests.get(csv_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid=0"
+    try:
+        r = requests.get(
+            csv_url,
+            timeout=20,
+            allow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/csv,text/plain,*/*",
+            },
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Google CSV 다운로드 실패: {type(e).__name__}: {e}") from e
+
+    content_type = (r.headers.get("content-type") or "").lower()
     text = r.text
-    if "accounts.google.com" in text.lower() or "sign in" in text.lower():
-        raise PermissionError("시트가 링크 공개 상태가 아니어서 읽을 수 없습니다.")
+    low = text[:1000].lower()
+    if "text/html" in content_type or "<html" in low or "<!doctype html" in low:
+        raise RuntimeError("Google이 CSV 대신 HTML 페이지를 반환했습니다. 시트 공개 설정을 확인하세요.")
+    if not text.strip():
+        raise RuntimeError("Google CSV가 비어 있습니다.")
 
-    raw = pd.read_csv(io.StringIO(text), header=None, dtype=str, keep_default_na=False)
-    header_row = None
-    for i in range(min(len(raw), 20)):
-        vals = [str(x).strip() for x in raw.iloc[i].tolist()]
-        if "종목" in vals and "비중" in vals:
-            header_row = i
-            break
-    if header_row is None:
-        raise ValueError("'종목'과 '비중' 헤더를 찾지 못했습니다. 시트 구조를 확인하세요.")
+    try:
+        raw = pd.read_csv(
+            io.StringIO(text),
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            on_bad_lines="skip",
+        )
+    except Exception as e:
+        raise RuntimeError(f"Google CSV 파싱 실패: {type(e).__name__}: {e}") from e
 
-    hdr = [str(x).strip() for x in raw.iloc[header_row].tolist()]
-    body = raw.iloc[header_row + 1:].reset_index(drop=True)
-
-    def idx(label):
-        try:
-            return hdr.index(label)
-        except ValueError:
-            return None
-
-    name_i = idx("종목")
-    code_i = idx("코드")
-    weight_i = idx("비중")
-    price_i = idx("현재가")
-    qty_i = idx("수량")
-    ret_i = idx("수익률")
-    value_i = weight_i - 1 if weight_i is not None and weight_i > 0 else None
-    if name_i is None or value_i is None:
-        raise ValueError("포트폴리오 핵심 열을 찾지 못했습니다.")
+    if raw.shape[1] < 13:
+        raise ValueError(f"현황 시트 열 수가 예상보다 적습니다: {raw.shape[1]}열")
 
     rows = []
-    for _, row in body.iterrows():
-        name = str(row.iloc[name_i]).strip() if name_i < len(row) else ""
-        if not name or name.lower() == "nan":
+    for _, row in raw.iterrows():
+        name = str(row.iloc[0]).strip() if len(row) > 0 else ""
+        if not name or name.lower() in {"nan", "none"}:
             continue
-        # 시트 하단 보조 계산영역/설명행 제외
-        if name.lower() in {"pluto"} or name.startswith("cma+"):
-            continue
-        val = _num(row.iloc[value_i]) if value_i < len(row) else np.nan
+        if name.lower().strip() == "pluto":
+            break
+        # Header/non-holding rows naturally drop out because E is not a positive number.
+        val = _num(row.iloc[4]) if len(row) > 4 else np.nan
         if pd.isna(val) or val <= 0:
             continue
-        code = _clean_code(row.iloc[code_i]) if code_i is not None and code_i < len(row) else ""
-        price = _num(row.iloc[price_i]) if price_i is not None and price_i < len(row) else np.nan
-        qty = _num(row.iloc[qty_i]) if qty_i is not None and qty_i < len(row) else 0
-        ret = _num(row.iloc[ret_i]) if ret_i is not None and ret_i < len(row) else np.nan
-        rows.append({"종목": name, "코드": code, "평가금액": val, "현재가": price, "수량": qty, "수익률": ret})
+
+        code = _clean_code(row.iloc[1]) if len(row) > 1 else ""
+        price = _num(row.iloc[6]) if len(row) > 6 else np.nan
+        qty = _num(row.iloc[10]) if len(row) > 10 else 0
+        ret = _num(row.iloc[12]) if len(row) > 12 else np.nan
+        rows.append({
+            "종목": name,
+            "코드": code,
+            "평가금액": val,
+            "현재가": price,
+            "수량": qty,
+            "수익률": ret,
+        })
 
     if not rows:
-        raise ValueError("유효한 보유종목 행을 찾지 못했습니다.")
-    df = pd.DataFrame(rows)
-    total = df["평가금액"].sum()
-    df["비중"] = df["평가금액"] / total * 100
-    df["데이터원"] = f"Google Sheet/{sheet_name}"
-    return df
+        preview = raw.head(10).astype(str).to_csv(index=False, header=False)[:1200]
+        raise ValueError(f"현황(gid=0)에서 보유종목을 찾지 못했습니다. CSV 상단: {preview}")
 
+    df = pd.DataFrame(rows)
+    total = float(df["평가금액"].sum())
+    if total <= 0:
+        raise ValueError("포트폴리오 평가금액 합계가 0 이하입니다.")
+    df["비중"] = df["평가금액"] / total * 100
+    df["데이터원"] = "Google Sheet/현황(gid=0) · LIVE CSV"
+    return df
 
 def load_portfolio_with_fallback(sheet_url, sheet_name):
     try:
@@ -959,7 +983,7 @@ def classify_holding(name: str, code: str):
         return "현금", "현금"
     if "vip" in n or "펀드" in n:
         return "펀드", "기타"
-    if c in {"ORCL", "MU", "BE", "LITE", "COHR"}:
+    if c in {"MU", "BE", "LITE", "COHR"}:
         return "미국 AI", "미국"
     if any(k in n for k in ["삼성전자", "반도체소부장", "반도체전공정"]):
         return "반도체", "한국"
@@ -1164,24 +1188,41 @@ def crash_radar_table():
         try:
             s = fetch_close(meta["ticker"])
             x = drawdown_event_metrics(s, meta["start_dd"])
+
+            ath_dd_series = s / s.cummax() - 1.0
+            worst_dd = float(ath_dd_series.min())
+            cur_ath_dd = float(ath_dd_series.iloc[-1])
+
+            # A volatile asset must be deep enough relative to ITS OWN history.
+            # Example: silver historical worst -80%, 60% progress => -48% gate,
+            # so a -29% fall cannot trigger even if recurrence looks rare.
+            depth_gate = min(float(meta["min_abs_mdd"]), worst_dd * float(meta["worst_frac"]))
+            depth_ok = bool(cur_ath_dd <= depth_gate)
+            progress = abs(cur_ath_dd) / abs(worst_dd) if worst_dd < 0 else np.nan
+
             x.update({
                 "자산": name,
                 "그룹": meta["group"],
                 "신호 프록시": meta["proxy"],
                 "이벤트 시작 기준": meta["start_dd"] * 100,
+                "역사적 최대 MDD": worst_dd * 100,
+                "자산별 진입선": depth_gate * 100,
+                "깊이 충족": depth_ok,
+                "최악낙폭 진행도": progress * 100 if pd.notna(progress) else np.nan,
             })
             rows.append(x)
-        except Exception:
+        except Exception as e:
             rows.append({
                 "자산": name, "그룹": meta["group"], "신호 프록시": meta["proxy"],
                 "이벤트 시작 기준": meta["start_dd"] * 100,
                 "현재 MDD": np.nan, "일별 폭락 percentile": np.nan, "ATH MDD": np.nan,
+                "역사적 최대 MDD": np.nan, "자산별 진입선": np.nan, "깊이 충족": False,
+                "최악낙폭 진행도": np.nan,
                 "현재 이벤트": False, "이벤트 시작일": "—", "현재 이벤트 최저 MDD": np.nan,
                 "과거 유사이상 이벤트": np.nan, "관측기간(년)": np.nan,
-                "평균 재현주기(년)": np.nan, "희귀도": "—", "기준일": "—",
+                "평균 재현주기(년)": np.nan, "희귀도": f"오류: {type(e).__name__}", "기준일": "—",
             })
     return pd.DataFrame(rows).set_index("자산")
-
 
 @st.cache_data(ttl=900, show_spinner=False)
 def latest_price(ticker: str):
@@ -1460,66 +1501,81 @@ def render_market_page(market_pack, percentile_years, freq_years):
 def render_crash_page(crash_df, settings):
     st.title("🚨 비주식 폭락 이벤트 레이더")
     st.caption(
-        "채권·원자재·코인은 일별 99 percentile 대신 독립적인 폭락 사건으로 묶습니다. "
-        "현재 낙폭과 같거나 더 심했던 과거 사건이 평균 몇 년에 한 번 있었는지를 계산하고, "
-        f"{settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 사건부터만 🔔 신호를 냅니다."
+        "비주식은 두 문턱을 모두 넘어야 합니다: ① 독립 폭락 이벤트가 충분히 드물 것, "
+        "② 그 자산 자체의 과거 하락폭에 비춰 충분히 깊게 빠졌을 것. "
+        "은·BTC처럼 고변동 자산은 얕은 하락에서 신호가 켜지지 않습니다."
     )
 
     df = crash_df.copy()
     rp = pd.to_numeric(df["평균 재현주기(년)"], errors="coerce")
     active = df["현재 이벤트"].fillna(False).astype(bool)
-    df["신호"] = np.where(active & (rp >= settings["min_return_period_years"]), "🔔 검토", "—")
-    # Infinity should sort first; NaN last.
+    depth_ok = df["깊이 충족"].fillna(False).astype(bool)
+    rare_ok = rp >= settings["min_return_period_years"]
+
+    df["신호"] = np.select(
+        [active & rare_ok & depth_ok, active & rare_ok & ~depth_ok],
+        ["🔔 검토", "👀 깊이 대기"],
+        default="—",
+    )
     df["_sort"] = rp.replace(np.inf, 1e9)
     df = df.sort_values(["신호", "_sort"], ascending=[True, False]).drop(columns="_sort")
 
     show_cols = [
-        "그룹", "신호 프록시", "현재 MDD", "현재 이벤트 최저 MDD", "일별 폭락 percentile",
-        "과거 유사이상 이벤트", "관측기간(년)", "평균 재현주기(년)", "희귀도", "신호", "이벤트 시작일", "기준일"
+        "그룹", "신호 프록시", "ATH MDD", "역사적 최대 MDD", "자산별 진입선", "최악낙폭 진행도",
+        "현재 이벤트 최저 MDD", "과거 유사이상 이벤트", "관측기간(년)",
+        "평균 재현주기(년)", "희귀도", "신호", "이벤트 시작일", "기준일"
     ]
     st.dataframe(
         df[show_cols].style.format({
-            "현재 MDD": "{:.1f}%",
+            "ATH MDD": "{:.1f}%",
+            "역사적 최대 MDD": "{:.1f}%",
+            "자산별 진입선": "{:.1f}%",
+            "최악낙폭 진행도": "{:.0f}%",
             "현재 이벤트 최저 MDD": "{:.1f}%",
-            "일별 폭락 percentile": "{:.1f}",
             "관측기간(년)": "{:.1f}",
             "평균 재현주기(년)": lambda x: _format_return_period(x),
         }, na_rep="—"),
         use_container_width=True,
     )
 
-    triggered = df[active & (rp >= settings["min_return_period_years"])]
+    triggered_mask = active & rare_ok & depth_ok
+    triggered = df[triggered_mask.reindex(df.index, fill_value=False)]
+    waiting_mask = active & rare_ok & ~depth_ok
+    waiting = df[waiting_mask.reindex(df.index, fill_value=False)]
+
+    if not waiting.empty:
+        for name, r in waiting.iterrows():
+            st.info(
+                f"{name}: 희귀도 조건은 충족했지만 현재 ATH MDD {r['ATH MDD']:.1f}%가 "
+                f"자산별 진입선 {r['자산별 진입선']:.1f}%보다 얕아서 매수 신호를 차단했습니다."
+            )
+
     if triggered.empty:
-        st.info(
-            f"현재 평균 {settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 비주식 폭락 이벤트가 없습니다. → 아무것도 하지 않음"
-        )
+        st.info("현재 '희귀도 + 자산별 깊이'를 동시에 충족한 비주식 기회가 없습니다. → 아무것도 하지 않음")
     else:
-        st.warning("신호가 켜져도 비주식 자산은 작은 비중만 허용합니다. 희귀할수록 비중을 조금 늘리되 한 자산 상한과 전체 상한을 지킵니다.")
+        st.warning("신호가 켜져도 비주식 자산은 작은 비중만 허용합니다.")
         total_suggested = 0.0
         for name, r in triggered.iterrows():
             suggested = suggested_cross_asset_weight(r["평균 재현주기(년)"], settings["cross_asset_each_pct"])
             total_suggested += suggested
             rp_txt = _format_return_period(r["평균 재현주기(년)"])
             st.markdown(
-                f"**{name}** · 현재 MDD {r['현재 MDD']:.1f}% · 과거 유사/이상 사건 {int(r['과거 유사이상 이벤트'])}회 / {r['관측기간(년)']:.1f}년 "
-                f"→ **평균 {rp_txt}에 한 번** · {r['희귀도']} · **총자산 {suggested:.1f}%p 검토**"
+                f"**{name}** · ATH MDD {r['ATH MDD']:.1f}% / 진입선 {r['자산별 진입선']:.1f}% "
+                f"· 과거 유사/이상 사건 {int(r['과거 유사이상 이벤트'])}회 / {r['관측기간(년)']:.1f}년 "
+                f"→ **평균 {rp_txt}에 한 번** · **총자산 {suggested:.1f}%p 검토**"
             )
         st.caption(
-            f"동시 신호 합산 제안 {min(total_suggested, settings['cross_asset_max_pct']):.1f}%p, 전체 상한 {settings['cross_asset_max_pct']:.1f}%p. "
-            "원자재는 선물가격을 신호로만 사용하며 PTP/세금/롤오버 때문에 실제 상품은 자동 지정하지 않습니다."
+            f"동시 신호 합산 제안 {min(total_suggested, settings['cross_asset_max_pct']):.1f}%p, "
+            f"전체 상한 {settings['cross_asset_max_pct']:.1f}%p."
         )
 
     st.markdown("""
-**이벤트 계산 방식**  
-- 자산별 최소 낙폭을 넘으면 폭락 이벤트 시작  
-- 이후 충분히 회복한 상태가 15거래일(코인은 15관측일) 이어져야 이벤트 종료  
-- 같은 하락장에서 며칠씩 99 percentile이 반복되어도 **한 사건으로만 계산**  
-- 현재 낙폭과 같거나 더 깊었던 **종료된 과거 사건 수**로 평균 재현주기를 계산  
-- 현재 진행 중인 사건은 과거 횟수에 포함하지 않음
-
-`일별 폭락 percentile`은 참고용으로만 남겨두고 **알림 여부에는 사용하지 않습니다.**
+**핵심 계산 방식**
+- 폭락의 **희귀도**: 같은 하락이 여러 날 이어져도 하나의 독립 이벤트로 묶어 재현주기 계산
+- 폭락의 **깊이**: 현재 ATH 대비 MDD가 각 자산별 최소 진입선보다 깊어야 함
+- 자산별 진입선 = `절대 최소 낙폭`과 `역사적 최악 MDD × 자산별 비율` 중 더 깊은 값
+- 따라서 은·BTC처럼 원래 변동성이 큰 자산은 -20~-30% 정도로는 신호가 나오지 않음
 """)
-
 
 def render_settings_page(settings):
     st.title("⚙️ 설정 / 규칙")
@@ -1527,13 +1583,13 @@ def render_settings_page(settings):
 ### 포트 데이터
 - Google Sheet: `{settings['sheet_url']}`
 - 탭 이름: `{settings['sheet_name']}`
-- 5분 캐시 후 자동 재조회
+- Google Sheet 포트는 현황 탭(gid=0) CSV를 매 rerun 시 LIVE 재조회
 
 ### 비주식 폭락 이벤트 규칙
 - 알림 문턱: **평균 {settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 사건부터**
 - 같은 하락이 여러 날 이어져도 **1개의 이벤트로 묶음**
 - 이벤트 종료: 충분한 회복 상태가 **15관측일 연속** 확인될 때
-- 일별 MDD percentile은 참고용이며 **알림 조건에는 사용하지 않음**
+- 알림은 **희귀도 + 자산별 깊이 필터**를 모두 통과해야 함
 - 1.5~4년급: 기본 **0.5%p** 검토
 - 4~8년급: 기본 **1.0%p** 검토
 - 8년+ 또는 관측기간 내 전례 없음: 기본 **1.5%p** 검토
@@ -1559,8 +1615,11 @@ def render_settings_page(settings):
 # =========================================================
 # UI — LEFT NAVIGATION
 # =========================================================
+BUILD_VERSION = "v14.1 FINAL · LIVE CSV · 현황 gid=0"
+
 with st.sidebar:
     st.title("🧭 Portfolio OS")
+    st.caption(BUILD_VERSION)
     page = st.radio("메뉴", ["🏠 내 포트", "📉 시장 레이더", "🚨 폭락 자산", "⚙️ 설정/설명"], label_visibility="collapsed")
     st.divider()
     percentile_years = st.selectbox("E-score 비교기간", [3, 5, 10], index=1, format_func=lambda x: f"최근 {x}년")
@@ -1568,7 +1627,7 @@ with st.sidebar:
     freq_years = {"최근 5년": 5, "최근 10년": 10, "전체 가용기간": None}[freq_choice]
     st.divider()
     sheet_url = st.text_input("포트 Google Sheet", value=DEFAULT_SHEET_URL)
-    sheet_name = st.text_input("포트 탭 이름", value=DEFAULT_SHEET_NAME)
+    sheet_name = st.text_input("포트 탭 이름 (고정)", value=DEFAULT_SHEET_NAME, disabled=True)
     min_return_period_years = st.slider("비주식 알림 최소 재현주기", 1.0, 10.0, 1.5, 0.5, format="%.1f년")
     cross_asset_each_pct = st.slider("비주식 1자산 최대 비중", 0.5, 2.0, 1.5, 0.5)
     cross_asset_max_pct = st.slider("비주식 신호 전체 최대 비중", 1.0, 6.0, 3.0, 0.5)
@@ -1592,7 +1651,7 @@ market_pack = load_core_market(percentile_years)
 crash_df = crash_radar_table()
 
 if portfolio_error:
-    st.warning(f"Google Sheet 자동 읽기 실패 → 8/16 fallback 포트를 사용 중입니다. 원인: {portfolio_error}")
+    st.warning(f"Google Sheet LIVE CSV 읽기 실패 → 최신 내장 fallback 포트를 사용 중입니다. 원인: {portfolio_error}")
 else:
     st.caption(f"✅ 포트 데이터: {portfolio['데이터원'].iloc[0]} · 최신 조회")
 
